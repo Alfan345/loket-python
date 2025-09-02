@@ -1,15 +1,9 @@
 from typing import List, Optional
 from PyQt5.QtWidgets import (
-    QMainWindow,
-    QWidget,
-    QLabel,
-    QVBoxLayout,
-    QHBoxLayout,
-    QFrame,
-    QSizePolicy,
-    QSpacerItem,
+    QMainWindow, QWidget, QLabel, QVBoxLayout, QHBoxLayout,
+    QFrame, QSizePolicy, QSpacerItem
 )
-from PyQt5.QtCore import Qt, QUrl, QTimer, QSize
+from PyQt5.QtCore import Qt, QUrl, QTimer
 from PyQt5.QtGui import QPixmap, QCursor
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
 from PyQt5.QtMultimediaWidgets import QVideoWidget
@@ -19,19 +13,28 @@ from ..models import CallEntry
 from ..widgets.marquee import MarqueeLabel
 from ..config import STYLE, LOGO_PATHS, VIDEO_PATH, LOOP_VIDEO
 
+# (Opsional) aktifkan kalau mau paksa topmost via Win32 (install: pip install pywin32)
+ENABLE_FORCE_TOPMOST = False
+try:
+    import win32gui, win32con  # type: ignore
+except Exception:
+    ENABLE_FORCE_TOPMOST = False
+
 
 class MainDisplayWindow(QMainWindow):
     """
-    Display utama dengan dukungan:
-      - Fullscreen / Kiosk (frameless, no menu, no status bar)
-      - Dinamis scaling font berdasarkan tinggi layar
-      - ESC & F11 handling
+    Display utama Fullscreen / Kiosk.
+    - Frameless
+    - Zero margin
+    - ESC pertama -> keluar fullscreen (jika mau), ESC kedua -> exit (atau Shift+ESC langsung exit)
+    - F11 toggle
+    - Re-apply fullscreen beberapa kali untuk mengatasi taskbar bandel.
     """
     def __init__(
         self,
         queue_manager: QueueManager,
-        start_fullscreen: bool = False,
-        kiosk: bool = False,
+        force_fullscreen: bool = True,
+        kiosk: bool = True,
         hide_cursor: bool = False,
         screen_geometry=None,
     ):
@@ -44,129 +47,136 @@ class MainDisplayWindow(QMainWindow):
         self.current_counter_label: QLabel
         self._video_player: Optional[QMediaPlayer] = None
         self._video_widget: Optional[QVideoWidget] = None
-        self._scale_factor = 1.0
-        self._screen_geometry = screen_geometry  # QScreen.geometry()
+        self._screen_geometry = screen_geometry
 
-        self._prepare_window_flags()
-        self._init_ui()
+        self._apply_window_flags()
+        self._build_ui()
+
         self.queue_manager.new_call.connect(self.update_display)
 
         if self.hide_cursor:
             self.setCursor(QCursor(Qt.BlankCursor))
 
-        # Atur posisi/dimensi ke layar target (kiosk)
+        # Atur posisi di layar target
         if self._screen_geometry:
-            geo = self._screen_geometry
-            self.setGeometry(geo)
-        if start_fullscreen:
-            self.showFullScreen()
-        elif kiosk:
-            # Jika kiosk tanpa fullscreen arg, tetap maximized
-            self.showMaximized()
+            self.setGeometry(self._screen_geometry)
 
-    # ---------- WINDOW FLAGS ----------
-    def _prepare_window_flags(self):
-        if self.kiosk:
-            # Hilangkan frame & judul
-            self.setWindowFlag(Qt.FramelessWindowHint, True)
-            # Pastikan di atas (opsional)
-            self.setWindowFlag(Qt.WindowStaysOnTopHint, False)
-        self.setWindowTitle("Display Antrian Loket")
-
-    # ---------- UI ----------
-    def _init_ui(self):
-        # Hitung scale factor berdasarkan tinggi layar (relative ke 1080)
-        if self._screen_geometry:
-            h = self._screen_geometry.height()
+        if force_fullscreen:
+            # Lakukan beberapa kali agar taskbar lenyap
+            self._enter_fullscreen_reliably()
         else:
-            # fallback
-            h = self.screen().size().height() if self.screen() else 1080
-        self._scale_factor = max(0.6, min(1.6, h / 1080.0))
+            self.show()
 
+    # ---------------- WINDOW FLAGS ----------------
+    def _apply_window_flags(self):
+        # Hilangkan frame & title
+        self.setWindowFlag(Qt.FramelessWindowHint, True)
+        # (Opsional) topmost
+        # self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, False)
+        self.setAttribute(Qt.WA_TranslucentBackground, False)
+
+    def _enter_fullscreen_reliably(self):
+        # 1) showFullScreen awal
+        self.showFullScreen()
+        # 2) Pastikan raise
+        self.raise_()
+        self.activateWindow()
+
+        # 3) Re-apply setelah event loop mulai
+        QTimer.singleShot(0, self._reassert_fullscreen)
+        # 4) Re-apply lagi setelah 200ms (beberapa kasus Windows 11)
+        QTimer.singleShot(200, self._reassert_fullscreen)
+        # 5) (Opsional) Paksa topmost
+        if ENABLE_FORCE_TOPMOST:
+            QTimer.singleShot(250, self._force_topmost)
+
+    def _reassert_fullscreen(self):
+        if not self.isFullScreen():
+            self.showFullScreen()
+        self.raise_()
+        self.activateWindow()
+
+    def _force_topmost(self):
+        try:
+            hwnd = int(self.winId())
+            win32gui.SetWindowPos(
+                hwnd,
+                win32con.HWND_TOPMOST,
+                0, 0, 0, 0,
+                win32con.SWP_NOMOVE
+                | win32con.SWP_NOSIZE
+                | win32con.SWP_NOACTIVATE
+                | win32con.SWP_SHOWWINDOW
+            )
+        except Exception:
+            pass
+
+    # ---------------- BUILD UI ----------------
+    def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
-        root_layout = QVBoxLayout()
-        # Kiosk: hilangkan margin & spacing
-        if self.kiosk:
-            root_layout.setContentsMargins(0, 0, 0, 0)
-            root_layout.setSpacing(0)
-        else:
-            root_layout.setContentsMargins(8, 8, 8, 8)
-            root_layout.setSpacing(10)
-        central.setLayout(root_layout)
+        root = QVBoxLayout(central)
+        # Zero margin untuk benar-benar penuh
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        # TOP
         top_layout = QHBoxLayout()
-        if self.kiosk:
-            top_layout.setContentsMargins(0, 0, 0, 0)
-            top_layout.setSpacing(0)
-        logos_container = self._build_logos_section()
-        marquee = MarqueeLabel(
-            "Selamat datang di Loket Antrian",
-            interval_ms=70,
-            stylesheet=STYLE["MARQUEE"],
-        )
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.setSpacing(0)
+
+        logos_container = self._build_logos()
+        marquee = MarqueeLabel("Selamat datang di Loket Antrian", interval_ms=70, stylesheet=STYLE["MARQUEE"])
         marquee.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+
         top_layout.addLayout(logos_container, 1)
         top_layout.addWidget(marquee, 4)
 
-        # MIDDLE
         middle_layout = QHBoxLayout()
-        if self.kiosk:
-            middle_layout.setContentsMargins(0, 0, 0, 0)
-            middle_layout.setSpacing(0)
-        video_area = self._build_video_area()
+        middle_layout.setContentsMargins(0, 0, 0, 0)
+        middle_layout.setSpacing(0)
+        video_area = self._build_video()
         info_panel = self._build_info_panel()
         middle_layout.addWidget(video_area, 3)
         middle_layout.addWidget(info_panel, 2)
 
-        root_layout.addLayout(top_layout, 1)
-        root_layout.addLayout(middle_layout, 7)
+        root.addLayout(top_layout, 1)
+        root.addLayout(middle_layout, 8)
 
-        if not self.kiosk:
-            # Status bar hanya jika bukan kiosk
-            self.statusBar().showMessage("Sistem Antrian Siap")
-        else:
-            # Sembunyikan menu bar & status bar
-            if self.menuBar():
-                self.menuBar().hide()
+        # Jangan tampilkan menu / status bar sama sekali (kiosk)
+        if self.menuBar():
+            self.menuBar().hide()
+        if self.statusBar():
+            self.statusBar().hide()
 
-    def _build_logos_section(self):
-        layout = QVBoxLayout()
-        layout.setContentsMargins(8 if not self.kiosk else 4, 8 if not self.kiosk else 4, 8 if not self.kiosk else 4, 8)
-        layout.setSpacing(8 if not self.kiosk else 6)
-        for idx in range(2):
-            if idx < len(LOGO_PATHS) and LOGO_PATHS[idx].is_file():
+    def _build_logos(self):
+        lay = QVBoxLayout()
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(8)
+        for i in range(2):
+            if i < len(LOGO_PATHS) and LOGO_PATHS[i].is_file():
                 lbl = QLabel()
-                pix = QPixmap(str(LOGO_PATHS[idx]))
+                pix = QPixmap(str(LOGO_PATHS[i]))
                 if not pix.isNull():
-                    target_w = int(220 * self._scale_factor)
-                    target_h = int(90 * self._scale_factor)
-                    lbl.setPixmap(pix.scaled(target_w, target_h, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                    lbl.setPixmap(pix.scaled(220, 90, Qt.KeepAspectRatio, Qt.SmoothTransformation))
                 else:
                     lbl.setText("LOGO ERR")
                     lbl.setAlignment(Qt.AlignCenter)
                 lbl.setStyleSheet("background-color:#0C4A3F; border-radius:6px;")
             else:
-                lbl = self._create_logo_placeholder(f"LOGO {idx+1}")
-            layout.addWidget(lbl)
-        layout.addStretch()
-        return layout
+                lbl = QLabel(f"LOGO {i+1}")
+                lbl.setAlignment(Qt.AlignCenter)
+                lbl.setStyleSheet(STYLE["LOGO_PLACEHOLDER"])
+                lbl.setMinimumHeight(80)
+            lay.addWidget(lbl)
+        lay.addStretch()
+        return lay
 
-    def _create_logo_placeholder(self, text: str) -> QLabel:
-        lbl = QLabel(text)
-        lbl.setAlignment(Qt.AlignCenter)
-        base_style = STYLE["LOGO_PLACEHOLDER"]
-        # Sesuaikan font-size relatif
-        lbl.setStyleSheet(base_style.replace("font-size:16px", f"font-size:{int(16*self._scale_factor)}px"))
-        lbl.setMinimumHeight(int(80 * self._scale_factor))
-        return lbl
-
-    def _build_video_area(self) -> QWidget:
+    def _build_video(self):
         if VIDEO_PATH.is_file():
             container = QFrame()
-            v_layout = QVBoxLayout(container)
-            v_layout.setContentsMargins(0, 0, 0, 0)
+            v = QVBoxLayout(container)
+            v.setContentsMargins(0, 0, 0, 0)
             self._video_widget = QVideoWidget()
             self._video_player = QMediaPlayer(None, QMediaPlayer.VideoSurface)
             self._video_player.setVideoOutput(self._video_widget)
@@ -174,14 +184,12 @@ class MainDisplayWindow(QMainWindow):
             self._video_player.play()
             if LOOP_VIDEO:
                 self._video_player.mediaStatusChanged.connect(self._loop_video)
-            v_layout.addWidget(self._video_widget)
+            v.addWidget(self._video_widget)
             return container
         else:
             lbl = QLabel("AREA VIDEO")
             lbl.setAlignment(Qt.AlignCenter)
-            style = STYLE["VIDEO_PLACEHOLDER"]
-            lbl.setStyleSheet(style.replace("font-size:26px", f"font-size:{int(26*self._scale_factor)}px"))
-            lbl.setMinimumSize(int(500 * self._scale_factor), int(350 * self._scale_factor))
+            lbl.setStyleSheet(STYLE["VIDEO_PLACEHOLDER"])
             lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             return lbl
 
@@ -190,93 +198,73 @@ class MainDisplayWindow(QMainWindow):
             self._video_player.setPosition(0)
             self._video_player.play()
 
-    def _build_info_panel(self) -> QWidget:
+    def _build_info_panel(self):
         container = QFrame()
-        container.setFrameShape(QFrame.StyledPanel)
         container.setStyleSheet(STYLE["BACKGROUND_PANEL"])
-        layout = QVBoxLayout(container)
-        layout.setContentsMargins(10 if not self.kiosk else 6, 10 if not self.kiosk else 6, 10 if not self.kiosk else 6, 10)
-        layout.setSpacing(6 if not self.kiosk else 4)
+        lay = QVBoxLayout(container)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
 
         title = QLabel("INFORMASI ANTRIAN")
         title.setAlignment(Qt.AlignCenter)
-        title_font_size = int(22 * self._scale_factor)
-        title.setStyleSheet(f"color:#F8FAFC; font-size:{title_font_size}px; font-weight:800; letter-spacing:2px;")
-        layout.addWidget(title)
+        title.setStyleSheet("color:#F8FAFC; font-size:28px; font-weight:800; letter-spacing:2px;")
+        lay.addWidget(title)
 
-        history_title = QLabel("3 Nomor Terakhir")
-        hist_font = int(15 * self._scale_factor)
-        history_title.setStyleSheet(f"color:#CBD5E1; font-size:{hist_font}px; font-weight:bold; margin-top:4px;")
-        layout.addWidget(history_title)
+        hist_title = QLabel("3 Nomor Terakhir")
+        hist_title.setStyleSheet("color:#CBD5E1; font-size:16px; font-weight:bold;")
+        lay.addWidget(hist_title)
 
         for _ in range(3):
-            h_lbl = QLabel("-")
-            base_hist_style = STYLE["HISTORY_ITEM"]
-            # Ganti font-size di style
-            h_lbl.setStyleSheet(base_hist_style.replace("font-size:16px", f"font-size:{int(16*self._scale_factor)}px"))
-            self.history_labels.append(h_lbl)
-            layout.addWidget(h_lbl)
+            h = QLabel("-")
+            h.setStyleSheet(STYLE["HISTORY_ITEM"])
+            self.history_labels.append(h)
+            lay.addWidget(h)
 
-        layout.addItem(QSpacerItem(10, 15, QSizePolicy.Minimum, QSizePolicy.Expanding))
+        lay.addItem(QSpacerItem(10, 15, QSizePolicy.Minimum, QSizePolicy.Expanding))
 
         self.current_number_label = QLabel("--")
         self.current_number_label.setAlignment(Qt.AlignCenter)
-        num_font = int(90 * self._scale_factor)
-        self.current_number_label.setStyleSheet(STYLE["CURRENT_NUMBER"] + f" font-size:{num_font}px;")
-        self.current_number_label.setMinimumHeight(int(160 * self._scale_factor))
-        layout.addWidget(self.current_number_label)
+        self.current_number_label.setStyleSheet(STYLE["CURRENT_NUMBER"] + "font-size:130px;")
+        self.current_number_label.setMinimumHeight(200)
+        lay.addWidget(self.current_number_label)
 
         self.current_counter_label = QLabel("Ke Loket -")
         self.current_counter_label.setAlignment(Qt.AlignCenter)
-        counter_font = int(32 * self._scale_factor)
-        self.current_counter_label.setStyleSheet(STYLE["CURRENT_COUNTER"] + f" font-size:{counter_font}px;")
-        layout.addWidget(self.current_counter_label)
+        self.current_counter_label.setStyleSheet(STYLE["CURRENT_COUNTER"] + "font-size:48px;")
+        lay.addWidget(self.current_counter_label)
 
-        sep = QFrame()
-        sep.setFrameShape(QFrame.HLine)
-        sep.setStyleSheet("color:#1E293B;")
-        layout.addWidget(sep)
-
-        footer = QLabel("© Sistem Antrian Modular")
-        footer.setAlignment(Qt.AlignCenter)
-        footer.setStyleSheet(f"color:#64748B; font-size:{int(12*self._scale_factor)}px;")
-        layout.addWidget(footer)
+        foot = QLabel("© Sistem Antrian Modular")
+        foot.setAlignment(Qt.AlignCenter)
+        foot.setStyleSheet("color:#64748B; font-size:14px;")
+        lay.addWidget(foot)
 
         return container
 
-    # ---------- UPDATE ----------
+    # ---------------- UPDATE ----------------
     def update_display(self, entry: CallEntry):
         self.current_number_label.setText(str(entry.number))
         self.current_counter_label.setText(f"Ke {entry.counter}")
         history = self.queue_manager.last_history(3)
-        for idx, lbl in enumerate(self.history_labels):
-            if idx < len(history):
-                h = history[idx]
+        for i, lbl in enumerate(self.history_labels):
+            if i < len(history):
+                h = history[i]
                 lbl.setText(f"Nomor {h.number} {h.counter}")
             else:
                 lbl.setText("-")
 
-    # ---------- INPUT ----------
-    def keyPressEvent(self, event):
-        key = event.key()
-        if key == Qt.Key_F11:
-            self._toggle_fullscreen()
-            return
-        if key == Qt.Key_Escape:
-            # Shift+ESC langsung tutup
-            if event.modifiers() & Qt.ShiftModifier:
-                self.close()
-                return
+    # ---------------- KEYS ----------------
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Escape:
+            # ESC pertama keluar fullscreen (kalau mau tetap running), ESC kedua tutup
             if self.isFullScreen():
-                # Keluar fullscreen tapi tetap terbuka
                 self.showNormal()
             else:
                 self.close()
             return
-        super().keyPressEvent(event)
-
-    def _toggle_fullscreen(self):
-        if self.isFullScreen():
-            self.showNormal()
-        else:
-            self.showFullScreen()
+        if e.key() == Qt.Key_F11:
+            if self.isFullScreen():
+                self.showNormal()
+            else:
+                self._enter_fullscreen_reliably()
+            return
+        super().keyPressEvent(e)
